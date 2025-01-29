@@ -31,7 +31,9 @@ all:
 Define your variables in the `group_vars/all.yml` file, referencing environment variables for all sensitive data:
 
 ```yaml
-arbitrum_data_path: /data
+base_data_path: /data
+arbitrum_path: "{{ base_data_path }}/arbitrum"
+nitro_path: "{{ arbitrum_path }}/nitro"
 chain_name: "arb1"
 snapshot_type: "pruned"
 

@@ -1,5 +1,7 @@
-arbitrum_data_path: /data
-chain_name: "arb1"
+base_data_path: /data
+arbitrum_path: "{{ base_data_path }}/arbitrum"
+nitro_path: "{{ arbitrum_path }}/nitro"
+chain_name: "sepolia-rollup"
 snapshot_type: "pruned"
 
 chain_id_map:
