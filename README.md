@@ -6,7 +6,7 @@ This Ansible playbook automates the deployment of an Arbitrum Nitro node with a 
 
 ## Requirements
 
-- **Instance Type:** AWS **i3en** with Ubuntu 20.04
+- **Instance Type:** AWS **i3en** with Ubuntu 20.04 (tested on i3en.2xl)
 - **Disks:** Minimum of 2 NVMe drives
 - **Tools:**
   - Ansible
