@@ -1,0 +1,286 @@
+---
+- name: Setup Arbitrum Node
+  hosts: arbitrum_node
+  become: true
+
+  tasks:
+    - name: Validate chain name
+      fail:
+        msg: "Invalid chain_name '{{ chain_name }}'. Valid options are: {{ chain_id_map.keys()|join(', ') }}"
+      when: chain_name not in chain_id_map
+
+    - name: Set chain ID
+      set_fact:
+        chain_id: "{{ chain_id_map[chain_name] }}"
+
+    - name: Debug - Show chain ID
+      debug:
+        msg: "Chain ID for {{ chain_name }}: {{ chain_id }}"
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - aria2
+          - xfsprogs
+          - mdadm
+          - nvme-cli
+        state: present
+
+    - name: Get NVMe instance store devices
+      shell: nvme list | awk '/Instance Storage/ {print $1}'
+      register: instance_stores
+      changed_when: false
+
+    - name: Debug - Show detected instance stores
+      debug:
+        msg: "Detected instance stores: {{ instance_stores.stdout_lines }}"
+
+    - name: Fail if no instance store devices found
+      fail:
+        msg: "No instance store devices found. Are you running on an i3en instance?"
+      when: instance_stores.stdout_lines|length == 0
+
+    - name: Create RAID0 array
+      command: >
+        mdadm --create --verbose --level=0 /dev/md0 
+        --name=DATA 
+        --raid-devices={{ instance_stores.stdout_lines | length }} 
+        {{ instance_stores.stdout_lines | join(' ') }}
+      args:
+        creates: /dev/md0
+
+    - name: Wait for device
+      wait_for:
+        path: /dev/md0
+        timeout: 30
+
+    - name: Check if RAID array has filesystem
+      command: file -s /dev/md0
+      register: raid_fs_check
+      changed_when: false
+
+    - name: Create XFS filesystem on RAID array
+      command: mkfs.xfs /dev/md0
+      when: "raid_fs_check.stdout == '/dev/md0: data'"
+
+    - name: Create mount point
+      file:
+        path: "{{ arbitrum_data_path }}"
+        state: directory
+        mode: "0755"
+        owner: "1000"
+        group: "1000"
+
+    - name: Get RAID array UUID
+      command: blkid -s UUID -o value /dev/md0
+      register: raid_uuid
+      changed_when: false
+
+    - name: Mount RAID array
+      mount:
+        path: "{{ arbitrum_data_path }}"
+        src: UUID={{ raid_uuid.stdout }}
+        fstype: xfs
+        state: mounted
+
+    - name: Save RAID configuration
+      shell: mdadm --detail --scan >> /etc/mdadm.conf
+      args:
+        creates: /etc/mdadm.conf
+
+    - name: Update initramfs
+      command: update-initramfs -u
+
+    - name: Install Docker
+      apt:
+        name: docker.io
+        state: present
+
+    - name: Ensure Docker service is running
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Get the latest snapshot directory
+      uri:
+        url: "https://snapshot.arbitrum.foundation/{{ chain_name }}/latest-{{ snapshot_type }}.txt"
+        return_content: yes
+      register: latest_snapshot
+
+    - name: Set snapshot_dir fact
+      set_fact:
+        snapshot_dir: "{{ latest_snapshot.content | trim }}"
+
+    - name: Fetch manifest file
+      uri:
+        url: "https://snapshot.arbitrum.foundation/{{ snapshot_dir }}.manifest.txt"
+        return_content: yes
+      register: manifest_file
+
+    - name: Initialize snapshot_parts list
+      set_fact:
+        snapshot_parts: []
+
+    - name: Parse manifest lines into snapshot_parts
+      set_fact:
+        snapshot_parts: "{{ snapshot_parts + [{
+          'checksum': item_split[0],
+          'url': 'https://snapshot.arbitrum.foundation/' ~ chain_name ~ '/' ~ item_split[1],
+          'filename': item_split[1] | regex_replace('^.*/', '')}] }}"
+      loop: "{{ manifest_file.content.split('\n') }}"
+      vars:
+        item_split: "{{ item.split('  ') }}"
+      when: item | length > 0
+
+    - name: Debug - Show constructed snapshot_parts
+      debug:
+        var: snapshot_parts
+
+    - name: Check if snapshot parts already exist
+      find:
+        paths: "{{ arbitrum_data_path }}"
+        patterns: "pruned.tar.part*"
+        file_type: file
+      register: snapshot_files
+
+    - name: Download Arbitrum Nitro snapshot parts
+      shell: >
+        aria2c --console-log-level=info --summary-interval=1 -Z -x 16 
+        {% for part in snapshot_parts %}"{{ part.url }}" {% endfor %}
+      args:
+        chdir: "{{ arbitrum_data_path }}"
+      register: aria_output
+      when: snapshot_files.matched == 0
+
+    # check that all parts exist
+    - name: Fail if not all snapshot parts were downloaded
+      find:
+        paths: "{{ arbitrum_data_path }}"
+        patterns: "pruned.tar.part*"
+        file_type: file
+      register: snapshot_files
+      failed_when: snapshot_files.matched != snapshot_parts|length
+
+    - name: Get CPU thread count
+      shell: nproc
+      register: cpu_threads
+      changed_when: false
+
+    - name: Check if checksums were already validated
+      stat:
+        path: "{{ arbitrum_data_path }}/.checksums_validated"
+      register: checksums_validated
+
+    - name: Define checksums and filenames as lists with full paths
+      set_fact:
+        checksums_list: "{{ snapshot_parts | map(attribute='checksum') | list }}"
+        filenames_list: "{{ snapshot_parts | map(attribute='filename') | map('regex_replace', '^(.*)$', arbitrum_data_path ~ '/\\1') | list }}"
+
+    - name: Place the checksum verification script
+      copy:
+        src: verify_checksums.sh
+        dest: /usr/local/bin/verify_checksums.sh
+        mode: "0755"
+
+    - name: Run the checksum script
+      shell: >
+        /usr/local/bin/verify_checksums.sh
+        {{ checksums_list|length }}
+        "{{ checksums_list | join(',') }}"
+        "{{ filenames_list | join(',') }}"
+      args:
+        chdir: "{{ arbitrum_data_path }}"
+      when: not checksums_validated.stat.exists
+
+    - name: Check if Nitro directory exists and contains files
+      find:
+        paths: "{{ arbitrum_data_path }}/nitro"
+        file_type: file
+      register: nitro_files
+
+    - name: Skip extraction if Nitro directory is not empty
+      when: nitro_files.matched > 0
+      debug:
+        msg: "Nitro directory already contains files. Skipping extraction."
+
+    #create the nitro directory if it doesn't exist
+    - name: Ensure Nitro directory exists
+      file:
+        path: "{{ arbitrum_data_path }}/nitro"
+        state: directory
+        mode: "0755"
+        owner: "1000"
+        group: "1000"
+
+    - name: Concatenate and extract parts
+      shell: |
+        cat {% for part in snapshot_parts %}{{ part.filename }} {% endfor %} | tar --owner=1000 --group=1000 -xf - -C nitro
+      args:
+        chdir: "{{ arbitrum_data_path }}"
+      when: nitro_files.matched == 0
+
+    - name: Start Arbitrum Nitro container
+      docker_container:
+        name: arbitrum-nitro
+        image: "{{ docker_image }}"
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - "{{ arbitrum_data_path }}:/home/user/data"
+        ports:
+          - "0.0.0.0:8547:8547"
+          - "0.0.0.0:8548:8548"
+        command: >
+          --parent-chain.connection.url {{ parent_chain_url }}
+          --parent-chain.blob-client.beacon-url {{ parent_chain_beacon_url }}
+          --chain.id {{ chain_id }}
+          --http.api=net,web3,eth,debug
+          --http.corsdomain="*"
+          --http.addr=0.0.0.0
+          --http.vhosts="*"
+          --persistent.chain=/home/user/data/
+
+    # Wait for Arbitrum Nitro to start
+    - name: Wait for Arbitrum Nitro rpc port to be open
+      wait_for:
+        host: 127.0.0.1
+        port: 8547
+        delay: 20
+        timeout: 300
+
+    # send a test rpc request
+    - name: Send a test RPC request for current block number post
+      uri:
+        url: http://127.0.0.1:8547
+        method: POST
+        body: '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+        body_format: json
+        return_content: yes
+      register: rpc_response
+      retries: 50
+      delay: 10 # Wait 5 seconds between retries
+      until: rpc_response.status == 200 # Retry until the HTTP status code is 200
+
+      #ensure the rpc response is valid
+    - name: Ensure RPC response is valid
+      assert:
+        that:
+          - rpc_response.status == 200
+          - rpc_response.json.result is match("0x[0-9a-fA-F]+")
+        fail_msg: "RPC response is invalid"
+        success_msg: "RPC response is valid"
+      register: rpc_response_valid
+
+    - name: Debug - Show RPC response
+      debug:
+        var: rpc_response.json
