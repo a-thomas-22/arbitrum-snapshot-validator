@@ -4,3 +4,4 @@ all:
       ansible_host: "{{ lookup('env', 'EC2_PUBLIC_IP') }}"
       ansible_user: ubuntu
       ansible_ssh_private_key_file: "{{ lookup('env', 'SSH_PRIVATE_KEY') }}"
+      ansible_python_interpreter: /usr/bin/python3.12

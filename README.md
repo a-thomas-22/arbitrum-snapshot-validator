@@ -72,3 +72,15 @@ Run the following command to execute the playbook:
 ```bash
 ansible-playbook -i inventory.yml site.yml
 ```
+
+## Accessing Logs
+
+Nitro logs are stored in the `/data/arbitrum/logs` directory on the server. The logs are automatically rotated when they reach 100MB in size, and up to 20 backup log files are kept.
+
+To view the logs:
+```bash
+ssh -i /path/to/key.pem ubuntu@<server-ip>
+tail -f /data/arbitrum/logs/nitro.log
+```
+
+You can also view archived logs in the same directory. The logs are compressed to save space.

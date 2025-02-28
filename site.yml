@@ -8,6 +8,12 @@
     arbitrum_path: "{{ base_data_path }}/arbitrum"
     nitro_path: "{{ arbitrum_path }}/nitro"
 
+  handlers:
+    - name: restart docker
+      service:
+        name: docker
+        state: restarted
+
   tasks:
     - name: Validate chain name
       fail:
@@ -40,6 +46,16 @@
           - nvme-cli
         state: present
 
+    - name: Check existing RAID configuration
+      command: mdadm --detail /dev/md0
+      register: raid_check
+      failed_when: false
+      changed_when: false
+
+    - name: Set RAID status
+      set_fact:
+        raid_configured: "{{ raid_check.rc == 0 }}"
+
     - name: Get NVMe instance store devices
       shell: nvme list | awk '/Instance Storage/ {print $1}'
       register: instance_stores
@@ -55,6 +71,7 @@
       when: instance_stores.stdout_lines|length == 0
 
     - name: Create RAID0 array
+      when: not raid_configured
       command: >
         mdadm --create --verbose --level=0 /dev/md0 
         --name=DATA 
@@ -64,24 +81,28 @@
         creates: /dev/md0
 
     - name: Wait for device
+      when: not raid_configured
       wait_for:
         path: /dev/md0
         timeout: 30
 
     - name: Check if RAID array has filesystem
+      when: not raid_configured
       command: file -s /dev/md0
       register: raid_fs_check
       changed_when: false
 
     - name: Create XFS filesystem on RAID array
       command: mkfs.xfs /dev/md0
-      when: "raid_fs_check.stdout == '/dev/md0: data'"
+      when: "not raid_configured and raid_fs_check.stdout == '/dev/md0: data'"
 
     - name: Create base mount point
       file:
         path: "{{ base_data_path }}"
         state: directory
         mode: "0755"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
 
     - name: Get RAID array UUID
       command: blkid -s UUID -o value /dev/md0
@@ -94,14 +115,31 @@
         src: UUID={{ raid_uuid.stdout }}
         fstype: xfs
         state: mounted
+        opts: "defaults,noatime"
+
+    - name: Ensure base mount point permissions after mounting
+      file:
+        path: "{{ base_data_path }}"
+        state: directory
+        mode: "0755"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
 
     - name: Create arbitrum directory
       file:
         path: "{{ arbitrum_path }}"
         state: directory
         mode: "0755"
-        owner: "1000"
-        group: "1000"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Create Nitro logs directory
+      file:
+        path: "{{ nitro_logs_path }}"
+        state: directory
+        mode: "0755"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
 
     - name: Save RAID configuration
       shell: mdadm --detail --scan >> /etc/mdadm.conf
@@ -116,11 +154,29 @@
         name: docker.io
         state: present
 
+    - name: Add ubuntu user to docker group
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+      notify: restart docker
+
     - name: Ensure Docker service is running
       service:
         name: docker
         state: started
         enabled: yes
+
+    - name: Fix ownership of existing files
+      shell: |
+        chown -R {{ ansible_user }}:{{ ansible_user }} {{ base_data_path }}
+        find {{ arbitrum_path }} -type f -name "*.aria2" -delete 2>/dev/null || true
+      ignore_errors: true
+
+    - name: Get local manifest if exists
+      stat:
+        path: "{{ arbitrum_path }}/current.manifest"
+      register: local_manifest
 
     - name: Get the latest snapshot directory
       uri:
@@ -137,6 +193,18 @@
         url: "https://snapshot.arbitrum.foundation/{{ snapshot_dir }}.manifest.txt"
         return_content: yes
       register: manifest_file
+
+    - name: Compare manifests
+      set_fact:
+        manifest_changed: "{{ not local_manifest.stat.exists or
+          (local_manifest.stat.exists and
+          manifest_file.content != lookup('file', arbitrum_path + '/current.manifest', errors='ignore') | default('')) }}"
+
+    - name: Save current manifest
+      copy:
+        content: "{{ manifest_file.content }}"
+        dest: "{{ arbitrum_path }}/current.manifest"
+      when: manifest_changed
 
     - name: Initialize snapshot_parts list
       set_fact:
@@ -157,29 +225,106 @@
       debug:
         var: snapshot_parts
 
-    - name: Check if snapshot parts already exist
-      find:
-        paths: "{{ arbitrum_path }}"
-        patterns: "pruned.tar.part*"
-        file_type: file
-      register: snapshot_files
+    - name: Install screen
+      apt:
+        name: screen
+        state: present
 
-    - name: Download Arbitrum Nitro snapshot parts
+    - name: Check if screen session already exists
+      shell: screen -ls | grep aria2c_download || true
+      register: screen_check
+      changed_when: false
+
+    - name: Kill existing screen session if it exists
+      shell: screen -S aria2c_download -X quit
+      when: screen_check.stdout != ""
+      ignore_errors: true
+
+    - name: Ensure no stale aria2c processes exist
+      shell: |
+        pkill -f aria2c || exit 0
+        sleep 2  # Wait for processes to fully terminate
+      when: manifest_changed
+      become: true
+      register: pkill_result
+      failed_when: false
+      changed_when: pkill_result.rc == 0
+
+    - name: Ensure screen log directory exists
+      file:
+        path: "{{ arbitrum_path }}/logs"
+        state: directory
+        mode: "0755"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      when: manifest_changed
+
+    - name: Run aria2c in a detachable screen session
+      when: manifest_changed
       shell: >
-        aria2c --console-log-level=info --summary-interval=1 -Z -x 16 
+        cd {{ arbitrum_path }} &&
+        screen -L -Logfile logs/aria2c_screen.log -dmS aria2c_download
+        aria2c
+        --console-log-level=warn
+        --summary-interval=1
+        --log="logs/aria2c.log"
+        --log-level=warn
+        -c -Z -x 16
+        --auto-file-renaming=false
         {% for part in snapshot_parts %}"{{ part.url }}" {% endfor %}
-      args:
-        chdir: "{{ arbitrum_path }}"
-      register: aria_output
-      when: snapshot_files.matched == 0
+      become: false
 
-    - name: Fail if not all snapshot parts were downloaded
+    - name: Verify screen session started correctly
+      shell: >
+        timeout 10 bash -c '
+        while ! screen -ls | grep -q "aria2c_download"; do
+          sleep 1;
+        done'
+      register: screen_check
+      failed_when: screen_check.rc != 0
+      when: manifest_changed
+      become: false
+
+    - name: Show instructions for viewing download progress
+      when: manifest_changed
+      debug:
+        msg:
+          - "aria2c is running in a screen session. To view the download progress:"
+          - "1. SSH to the server: ssh {{ ansible_user }}@{{ ansible_host }}"
+          - "2. Attach to the screen session: screen -r aria2c_download"
+          - "3. To detach without killing the process: Ctrl+A followed by d"
+          - "4. Alternatively, view the log file: tail -f {{ arbitrum_path }}/aria2c_download.log"
+
+    - name: Wait for aria2c to complete
+      when: manifest_changed
+      shell: >
+        while screen -list | grep -q "aria2c_download"; do
+          if ! pgrep -f "aria2c.*{{ snapshot_parts[0].url }}" > /dev/null; then
+            echo "aria2c process not found but screen session exists. Cleaning up.";
+            screen -S aria2c_download -X quit;
+            exit 1;
+          fi;
+          sleep 10;
+        done
+      args:
+        executable: /bin/bash
+      register: wait_result
+      failed_when: wait_result.rc != 0
+      become: false
+
+    - name: Remove checksum validation status
+      file:
+        path: "{{ arbitrum_path }}/.checksums_validated"
+        state: absent
+
+    - name: Verify all snapshot parts were downloaded
       find:
         paths: "{{ arbitrum_path }}"
-        patterns: "pruned.tar.part*"
+        patterns: "{{ item.filename }}"
         file_type: file
-      register: snapshot_files
-      failed_when: snapshot_files.matched != snapshot_parts|length
+      register: downloaded_file
+      loop: "{{ snapshot_parts }}"
+      failed_when: downloaded_file.matched == 0
 
     - name: Get CPU thread count
       shell: nproc
@@ -202,50 +347,208 @@
         dest: /usr/local/bin/verify_checksums.sh
         mode: "0755"
 
-    - name: Run the checksum script
-      shell: >
-        /usr/local/bin/verify_checksums.sh
-        {{ checksums_list|length }}
-        "{{ checksums_list | join(',') }}"
-        "{{ filenames_list | join(',') }}"
-      args:
-        chdir: "{{ arbitrum_path }}"
+    - name: Verify checksums with retry
+      block:
+        - name: Run the checksum script
+          shell: >
+            /usr/local/bin/verify_checksums.sh
+            {{ checksums_list|length }}
+            "{{ checksums_list | join(',') }}"
+            "{{ filenames_list | join(',') }}"
+          args:
+            chdir: "{{ arbitrum_path }}"
+          register: checksum_result
+          failed_when: checksum_result.rc != 0 and checksum_result.rc != 2
+
+        - name: Handle failed checksums
+          block:
+            - name: Read failed checksums file
+              slurp:
+                src: "{{ arbitrum_path }}/.checksum_failures.txt"
+              register: failed_checksums_content
+
+            - name: Extract failed filenames (improved)
+              set_fact:
+                failed_files: "{{ ((failed_checksums_content.content | b64decode) | default('')).split('\n') | select('regex', '.+') | list }}"
+              when: failed_checksums_content is defined and failed_checksums_content.content is defined
+              ignore_errors: true
+              register: extraction_result
+
+            - name: Debug extraction result
+              debug:
+                var: extraction_result
+              when: extraction_result is defined
+
+            - name: Set empty failed_files if extraction failed
+              set_fact:
+                failed_files: []
+              when: failed_files is not defined or extraction_result is failed
+
+            - name: Debug - Show failed files
+              debug:
+                msg: "Files with failed checksums: {{ failed_files | default([]) | map('regex_replace', '^(.*?)\\|.*$', '\\1') | map('basename') | list }}"
+              when: failed_files is defined
+
+            - name: Check if redownload screen session already exists
+              shell: screen -ls | grep aria2c_redownload || true
+              register: redownload_screen_check
+              changed_when: false
+
+            - name: Kill existing redownload screen session if it exists
+              shell: screen -S aria2c_redownload -X quit
+              when: redownload_screen_check.stdout != ""
+              ignore_errors: true
+
+            - name: Run aria2c redownload in a detachable screen session
+              shell: >
+                cd {{ arbitrum_path }} &&
+                screen -L -Logfile logs/aria2c_redownload_screen.log -dmS aria2c_redownload
+                aria2c
+                --console-log-level=warn
+                --summary-interval=1
+                --log="logs/aria2c_redownload.log"
+                --log-level=warn
+                -c -Z -x 16
+                --auto-file-renaming=false
+                {% for file_entry in failed_files | default([]) %}
+                {% set file_parts = file_entry.split('|') %}
+                {% set filename = file_parts[0] | basename %}
+                {% set file_url = snapshot_parts | selectattr('filename', 'equalto', filename) | map(attribute='url') | first %}
+                "{{ file_url }}"
+                {% endfor %}
+              become: false
+              when: failed_files is defined and failed_files | length > 0
+
+            - name: Verify redownload screen session started correctly
+              shell: >
+                timeout 10 bash -c '
+                while ! screen -ls | grep -q "aria2c_redownload"; do
+                  sleep 1;
+                done'
+              register: redownload_screen_check
+              failed_when: redownload_screen_check.rc != 0
+              when: failed_files is defined and failed_files | length > 0
+              become: false
+
+            - name: Show instructions for viewing redownload progress
+              debug:
+                msg:
+                  - "aria2c is redownloading failed files in a screen session. To view the progress:"
+                  - "1. SSH to the server: ssh {{ ansible_user }}@{{ ansible_host }}"
+                  - "2. Attach to the screen session: screen -r aria2c_redownload"
+                  - "3. To detach without killing the process: Ctrl+A followed by d"
+                  - "4. Alternatively, view the log file: tail -f {{ arbitrum_path }}/aria2c_redownload.log"
+
+            - name: Wait for aria2c redownload to complete
+              shell: >
+                while screen -list | grep -q "aria2c_redownload"; do
+                  if ! pgrep -f "aria2c.*redownload" > /dev/null; then
+                    echo "aria2c redownload process not found but screen session exists. Cleaning up.";
+                    screen -S aria2c_redownload -X quit;
+                    exit 1;
+                  fi;
+                  sleep 10;
+                done
+              args:
+                executable: /bin/bash
+              register: redownload_wait_result
+              failed_when: redownload_wait_result.rc != 0
+              become: false
+
+            - name: Re-run checksum verification
+              shell: >
+                /usr/local/bin/verify_checksums.sh
+                {{ checksums_list|length }}
+                "{{ checksums_list | join(',') }}"
+                "{{ filenames_list | join(',') }}"
+              args:
+                chdir: "{{ arbitrum_path }}"
+              register: retry_result
+              retries: 2
+              delay: 5
+              until: retry_result.rc == 0
+              failed_when: false
+
+            - name: Debug - Show checksum verification output
+              debug:
+                msg:
+                  - "Return code: {{ retry_result.rc }}"
+                  - "Stdout:"
+                  - "{{ retry_result.stdout_lines | default([]) }}"
+                  - "Stderr:"
+                  - "{{ retry_result.stderr_lines | default([]) }}"
+              when: retry_result is defined
+
+            - name: Show failed checksums file content if it exists
+              shell: "cat {{ arbitrum_path }}/.checksum_failures.txt"
+              register: failures_content
+              when: retry_result.rc != 0
+              failed_when: false
+
+            - name: Debug - Show failed checksums
+              debug:
+                msg: "Failed checksums:\n{{ (failures_content.content | b64decode).split('\n') }}"
+              when: failures_content is defined and failures_content.content | default('') != ''
+
+            - name: Check if validation succeeded after retries
+              stat:
+                path: "{{ arbitrum_path }}/.checksums_validated"
+              register: final_validation
+
+            - name: Fail if validation still unsuccessful
+              fail:
+                msg: "Checksum validation failed after multiple attempts. Some files may be corrupted."
+              when: not final_validation.stat.exists
+          when: checksum_result.rc == 2
       when: not checksums_validated.stat.exists
 
-    - name: Check if Nitro directory exists and contains files
+    - name: Check for any content in Nitro directory
       find:
         paths: "{{ nitro_path }}"
-        file_type: file
-      register: nitro_files
+        recurse: no
+      register: nitro_contents
 
     - name: Skip extraction if Nitro directory is not empty
-      when: nitro_files.matched > 0
+      when: nitro_contents.matched > 0
       debug:
-        msg: "Nitro directory already contains files. Skipping extraction."
+        msg: "Nitro directory contains existing content. Skipping extraction."
 
     - name: Ensure Nitro directory exists
       file:
         path: "{{ nitro_path }}"
         state: directory
         mode: "0755"
-        owner: "1000"
-        group: "1000"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
 
     - name: Concatenate and extract parts
       shell: |
-        cat {% for part in snapshot_parts %}{{ part.filename }} {% endfor %} | tar --owner=1000 --group=1000 -xf - -C nitro
+        cat {% for part in snapshot_parts %}{{ part.filename }} {% endfor %} | tar --owner={{ ansible_user }} --group={{ ansible_user }} -xf - -C nitro
       args:
         chdir: "{{ arbitrum_path }}"
-      when: nitro_files.matched == 0
+      when: nitro_contents.matched == 0
+
+    - name: Check if container exists with correct configuration
+      docker_container_info:
+        name: arbitrum-nitro
+      register: container_info
+
+    - name: Set container status
+      set_fact:
+        container_needs_update: "{{ not container_info.exists or
+          container_info.container.Config.Image != docker_image or
+          container_info.container.State.Status != 'running' }}"
 
     - name: Start Arbitrum Nitro container
+      when: container_needs_update
       docker_container:
         name: arbitrum-nitro
         image: "{{ docker_image }}"
         state: started
         restart_policy: unless-stopped
+        user: "root"
         volumes:
-          - "{{ arbitrum_path }}:/home/user/data"
+          - "{{ arbitrum_path }}:/home/user/data:rw"
         ports:
           - "0.0.0.0:8547:8547"
           - "0.0.0.0:8548:8548"
@@ -258,6 +561,12 @@
           --http.addr=0.0.0.0
           --http.vhosts="*"
           --persistent.chain=/home/user/data
+          --file-logging.enable=true
+          --file-logging.file=/home/user/data/logs/nitro.log
+          --file-logging.max-size=100
+          --file-logging.max-backups=20
+          --file-logging.compress=true
+          --file-logging.buf-size=512
 
     - name: Wait for Arbitrum Nitro rpc port to be open
       wait_for:

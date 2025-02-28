@@ -3,12 +3,13 @@ arbitrum_path: "{{ base_data_path }}/arbitrum"
 nitro_path: "{{ arbitrum_path }}/nitro"
 chain_name: "arb1"
 snapshot_type: "pruned"
+nitro_logs_path: "{{ arbitrum_path }}/logs"
 
 chain_id_map:
   arb1: 42161
   sepolia-rollup: 421614
   nova: 42170
 
-docker_image: "offchainlabs/nitro-node:v3.4.0-d896e9c"
+docker_image: "offchainlabs/nitro-node:v3.5.2-33d30c0"
 parent_chain_url: "{{ lookup('env', 'PARENT_CHAIN_URL') }}"
 parent_chain_beacon_url: "{{ lookup('env', 'PARENT_CHAIN_BEACON_URL') }}"
