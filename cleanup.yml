@@ -1,0 +1,146 @@
+---
+- name: Clean up Arbitrum Snapshot Validation Resources
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - group_vars/all.yml
+
+  vars:
+    aws_region: us-west-2
+    aws_profile: "{{ lookup('env', 'AWS_PROFILE') | default(omit) }}"
+    security_group_name: arbitrum-snapshot-verification-sg
+    delete_keypair: "{{ lookup('env', 'DELETE_KEYPAIR') | default('false') }}"
+    key_name: "{{ lookup('env', 'AWS_KEY_NAME') | default('arbitrum-node-key') }}"
+    chain_filter: "{{ chain_name | default('*') }}"
+    dry_run: "{{ lookup('env', 'DRY_RUN') | default('false') }}"
+
+  tasks:
+    - name: Ensure boto3 is installed
+      pip:
+        name: boto3
+        state: present
+      become: false
+
+    - name: Find EC2 instances with snapshot-verification tag
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        profile: "{{ aws_profile }}"
+        filters:
+          "tag:Purpose": snapshot-verification
+          "tag:Chain": "{{ chain_filter }}"
+      register: ec2_instances
+
+    - name: Display instances that would be terminated (dry run)
+      debug:
+        msg: |
+          DRY RUN: The following instances would be terminated:
+          {% for instance in ec2_instances.instances %}
+          - Instance ID: {{ instance.instance_id }}
+            Name: {{ instance.tags.Name }}
+            Chain: {{ instance.tags.Chain }}
+            Public IP: {{ instance.public_ip_address }}
+          {% endfor %}
+      when: dry_run | bool
+
+    - name: Display instances to be terminated
+      debug:
+        msg: |
+          The following instances will be terminated:
+          {% for instance in ec2_instances.instances %}
+          - Instance ID: {{ instance.instance_id }}
+            Name: {{ instance.tags.Name }}
+            Chain: {{ instance.tags.Chain }}
+            Public IP: {{ instance.public_ip_address }}
+          {% endfor %}
+      when: not dry_run | bool and ec2_instances.instances | length > 0
+
+    - name: Terminate EC2 instances
+      amazon.aws.ec2_instance:
+        instance_ids: "{{ item.instance_id }}"
+        state: absent
+        region: "{{ aws_region }}"
+        profile: "{{ aws_profile }}"
+      loop: "{{ ec2_instances.instances }}"
+      when: not dry_run | bool and ec2_instances.instances | length > 0
+
+    - name: Wait for instances to be terminated
+      pause:
+        seconds: 30
+      when: not dry_run | bool and ec2_instances.instances | length > 0
+
+    - name: Find security group
+      amazon.aws.ec2_group_info:
+        region: "{{ aws_region }}"
+        profile: "{{ aws_profile }}"
+        filters:
+          group-name: "{{ security_group_name }}"
+      register: security_groups
+
+    - name: Display security groups that would be deleted (dry run)
+      debug:
+        msg: |
+          DRY RUN: The following security groups would be deleted:
+          {% for sg in security_groups.security_groups %}
+          - Security Group ID: {{ sg.group_id }}
+            Name: {{ sg.group_name }}
+            Description: {{ sg.description }}
+          {% endfor %}
+      when: dry_run | bool and security_groups.security_groups | length > 0
+
+    - name: Display security groups to be deleted
+      debug:
+        msg: |
+          The following security groups will be deleted:
+          {% for sg in security_groups.security_groups %}
+          - Security Group ID: {{ sg.group_id }}
+            Name: {{ sg.group_name }}
+            Description: {{ sg.description }}
+          {% endfor %}
+      when: not dry_run | bool and security_groups.security_groups | length > 0
+
+    - name: Delete security group
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name }}"
+        region: "{{ aws_region }}"
+        profile: "{{ aws_profile }}"
+        state: absent
+      when: not dry_run | bool and security_groups.security_groups | length > 0
+      register: sg_delete
+      ignore_errors: true
+
+    - name: Display key pair that would be deleted (dry run)
+      debug:
+        msg: "DRY RUN: Key pair '{{ key_name }}' would be deleted"
+      when: dry_run | bool and delete_keypair | bool
+
+    - name: Display key pair to be deleted
+      debug:
+        msg: "Key pair '{{ key_name }}' will be deleted"
+      when: not dry_run | bool and delete_keypair | bool
+
+    - name: Delete key pair if requested
+      amazon.aws.ec2_key:
+        name: "{{ key_name }}"
+        region: "{{ aws_region }}"
+        profile: "{{ aws_profile }}"
+        state: absent
+      when: not dry_run | bool and delete_keypair | bool
+
+    - name: Summary of cleanup actions
+      debug:
+        msg: |
+          {% if dry_run | bool %}
+          DRY RUN SUMMARY:
+          - Would terminate {{ ec2_instances.instances | length }} EC2 instances
+          - Would delete {{ security_groups.security_groups | length }} security groups
+          - Would {{ 'delete' if delete_keypair | bool else 'keep' }} key pair '{{ key_name }}'
+
+          To execute these actions, run again without the DRY_RUN=true parameter.
+          {% else %}
+          CLEANUP SUMMARY:
+          - Terminated {{ ec2_instances.instances | length }} EC2 instances
+          - Deleted {{ security_groups.security_groups | length }} security groups
+          - {{ 'Deleted' if delete_keypair | bool else 'Kept' }} key pair '{{ key_name }}'
+          {% endif %}

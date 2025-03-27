@@ -1,0 +1,190 @@
+---
+- name: Provision EC2 Instance for Arbitrum Snapshot Validation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - group_vars/all.yml
+
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"
+    aws_region: us-west-2
+    aws_profile: "{{ lookup('env', 'AWS_PROFILE') | default(omit) }}"
+    instance_type: i3en.2xlarge
+    ami_id: ami-0c65adc9a5c1b5d7c # Ubuntu 20.04 LTS in us-west-2, update as needed
+    key_name: "{{ lookup('env', 'AWS_KEY_NAME') | default('arbitrum-node-key') }}"
+    security_group_name: arbitrum-snapshot-verification-sg
+    instance_name: arbitrum-snapshot-validator
+    vpc_subnet_id: "{{ lookup('env', 'AWS_SUBNET_ID') | default(omit) }}"
+    private_key_path: "{{ lookup('env', 'SSH_PRIVATE_KEY') | default(lookup('env', 'PRIVATE_KEY_PATH')) | default(omit) }}"
+    public_key_path: "{{ lookup('env', 'PUBLIC_KEY_PATH') | default(omit) }}"
+
+  tasks:
+    - name: Generate public key from private key if provided
+      shell: "ssh-keygen -y -f {{ private_key_path }}"
+      register: generated_public_key
+      when: private_key_path is defined and private_key_path != "" and private_key_path != "None"
+      ignore_errors: true
+
+    - name: Ensure boto3 is installed
+      pip:
+        name: boto3
+        state: present
+      become: false
+
+    - name: Create security group
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name }}"
+        description: Security group for Arbitrum snapshot verification
+        region: "{{ aws_region }}"
+        profile: "{{ aws_profile }}"
+        rules:
+          - proto: tcp
+            ports: 22
+            cidr_ip: 0.0.0.0/0
+            rule_desc: Allow SSH
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+      register: security_group
+
+    - name: Debug variables
+      debug:
+        msg:
+          - "AWS Region: {{ aws_region }}"
+          - "AWS Profile: {{ aws_profile }}"
+          - "Key Name: {{ key_name }}"
+
+    - name: Check if key pair exists
+      amazon.aws.ec2_key_info:
+        names: ["{{ key_name }}"]
+        region: "{{ aws_region }}"
+        profile: "{{ aws_profile }}"
+      register: key_check
+      ignore_errors: true
+
+    - name: Debug key check response
+      debug:
+        msg:
+          - "Key check response:"
+          - "Failed: {{ key_check.failed | default(false) }}"
+          - "Key pairs: {{ key_check.key_pairs | default([]) }}"
+          - "Message: {{ key_check.msg | default('No error message') }}"
+
+    - name: Read public key file or use generated public key
+      slurp:
+        src: "{{ public_key_path }}"
+      register: public_key_content
+      when:
+        - public_key_path is defined and public_key_path != ""
+        - generated_public_key is not defined or generated_public_key is failed
+      ignore_errors: true
+
+    - name: Import public key if needed
+      amazon.aws.ec2_key:
+        name: "{{ key_name }}"
+        region: "{{ aws_region }}"
+        profile: "{{ aws_profile }}"
+        key_material: "{{ (generated_public_key.stdout | default('')) or (public_key_content.content | b64decode) }}"
+        state: present
+      register: key_import_result
+      when:
+        - key_check.key_pairs | default([]) | length == 0 and generated_public_key is defined
+        - (
+          (generated_public_key is success and generated_public_key.stdout is defined) or
+          (public_key_content is success and public_key_content.content is defined)
+          )
+
+    - name: Display key pair status
+      debug:
+        msg:
+          - "Key pair status:"
+          - "  Name: {{ key_name }}"
+          - "  Private key path: {{ private_key_path | default(lookup('env', 'SSH_PRIVATE_KEY')) }}"
+          - "  Action taken: {{ 'Imported new key' if key_import_result.changed | default(false) else ('Using existing key' if not key_check.failed else 'No action taken') }}"
+
+    - name: Verify key pair setup
+      block:
+        - name: Check key pair availability
+          assert:
+            that:
+              - >-
+                key_check.failed is not defined or
+                not key_check.failed or
+                key_check.key_pairs | default([]) | length > 0 or
+                key_import_result.changed | default(false)
+            fail_msg: >-
+              Key pair '{{ key_name }}' is not properly set up:
+              {% if key_check.key_pairs | default([]) | length == 0 %}
+              - Key does not exist in AWS
+              {% endif %}
+              {% if not generated_public_key.stdout | default(false) and not public_key_content.content | default(false) %}
+              - No valid public key available (either generated or provided)
+              {% endif %}
+
+              Please either:
+              1. Use an existing AWS key pair name in AWS_KEY_NAME
+              2. Provide a private key path in SSH_PRIVATE_KEY
+              3. Provide a public key path in PUBLIC_KEY_PATH
+            success_msg: "Key pair '{{ key_name }}' is properly configured"
+
+    - name: Launch EC2 instance
+      amazon.aws.ec2_instance:
+        name: "{{ instance_name }}"
+        key_name: "{{ key_name }}"
+        security_group: "{{ security_group_name }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        region: "{{ aws_region }}"
+        profile: "{{ aws_profile }}"
+        vpc_subnet_id: "{{ vpc_subnet_id }}"
+        network:
+          assign_public_ip: true
+        wait: true
+        tags:
+          Name: "{{ instance_name }}"
+          Purpose: "snapshot-verification"
+          Environment: "testnet"
+          Chain: "{{ chain_name | default('sepolia-rollup') }}"
+          NetworkType: "rollup"
+          ProjectVersion: "1.0"
+      register: ec2
+
+    - name: Wait for SSH port to open
+      wait_for:
+        host: "{{ ec2.instances[0].public_ip_address }}"
+        port: 22
+        delay: 10
+        timeout: 320
+        state: started
+
+    - name: Wait for SSH to become available
+      command: >
+        ssh -o BatchMode=yes
+            -o ConnectTimeout=5
+            -o StrictHostKeyChecking=accept-new
+            -i {{ private_key_path }}
+            ubuntu@{{ ec2.instances[0].public_ip_address }}
+            echo "SSH connection successful"
+      register: ssh_check
+      until: ssh_check is success
+      retries: 30
+      delay: 10
+      delegate_to: localhost
+
+    - name: Display EC2 instance information
+      debug:
+        msg:
+          - "Instance ID: {{ ec2.instances[0].instance_id }}"
+          - "Public IP: {{ ec2.instances[0].public_ip_address }}"
+          - "Private IP: {{ ec2.instances[0].private_ip_address }}"
+          - "Instance will be automatically discovered by the dynamic inventory"
+
+    - name: Wait for AWS to register instance with tags
+      pause:
+        seconds: 30
+      when: ec2.changed
+
+    - name: Refresh inventory to ensure new instance is available
+      meta: refresh_inventory

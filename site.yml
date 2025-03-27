@@ -1,12 +1,30 @@
 ---
+- name: Import EC2 provisioning playbook
+  import_playbook: provision_ec2.yml
+
 - name: Setup Arbitrum Node
-  hosts: arbitrum_node
+  hosts: all
   become: true
+  remote_user: ubuntu
+  gather_facts: false
 
   vars:
+    ansible_ssh_private_key_file: "{{ lookup('env', 'SSH_PRIVATE_KEY') | default(lookup('env', 'PRIVATE_KEY_PATH')) }}"
     base_data_path: /data
     arbitrum_path: "{{ base_data_path }}/arbitrum"
     nitro_path: "{{ arbitrum_path }}/nitro"
+    nitro_logs_path: "{{ arbitrum_path }}/logs"
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
+
+  pre_tasks:
+    - name: Debug connection information
+      debug:
+        msg:
+          - "SSH User: {{ ansible_user | default('ubuntu') }}"
+          - "SSH Key File: {{ ansible_ssh_private_key_file }}"
+          - "SSH Host: {{ ansible_host | default('unknown') }}"
+      delegate_to: localhost
+      run_once: true
 
   handlers:
     - name: restart docker
@@ -92,9 +110,9 @@
       register: raid_fs_check
       changed_when: false
 
-    - name: Create XFS filesystem on RAID array
-      command: mkfs.xfs /dev/md0
-      when: "not raid_configured and raid_fs_check.stdout == '/dev/md0: data'"
+    - name: Create XFS filesystem
+      command: mkfs.xfs -f /dev/md0
+      when: not raid_configured
 
     - name: Create base mount point
       file:
@@ -105,17 +123,32 @@
         group: "{{ ansible_user }}"
 
     - name: Get RAID array UUID
-      command: blkid -s UUID -o value /dev/md0
+      shell: blkid -s UUID -o value /dev/md0 || true
       register: raid_uuid
       changed_when: false
+
+    - name: Check if already mounted
+      shell: mountpoint -q {{ base_data_path }} || echo "not mounted"
+      register: mount_check
+      changed_when: false
+
+    - name: Wait for device to stabilize
+      command: udevadm settle
+      when: not raid_configured and mount_check.stdout == "not mounted"
 
     - name: Mount RAID array
       mount:
         path: "{{ base_data_path }}"
-        src: UUID={{ raid_uuid.stdout }}
+        src: "/dev/md0"
         fstype: xfs
         state: mounted
         opts: "defaults,noatime"
+      when: not raid_configured and mount_check.stdout == "not mounted"
+
+    - name: Verify mount
+      shell: mountpoint -q {{ base_data_path }}
+      register: mount_verify
+      failed_when: mount_verify.rc != 0
 
     - name: Ensure base mount point permissions after mounting
       file:
@@ -220,10 +253,6 @@
       vars:
         item_split: "{{ item.split('  ') }}"
       when: item | length > 0
-
-    - name: Debug - Show constructed snapshot_parts
-      debug:
-        var: snapshot_parts
 
     - name: Install screen
       apt:
@@ -374,20 +403,10 @@
               ignore_errors: true
               register: extraction_result
 
-            - name: Debug extraction result
-              debug:
-                var: extraction_result
-              when: extraction_result is defined
-
             - name: Set empty failed_files if extraction failed
               set_fact:
                 failed_files: []
               when: failed_files is not defined or extraction_result is failed
-
-            - name: Debug - Show failed files
-              debug:
-                msg: "Files with failed checksums: {{ failed_files | default([]) | map('regex_replace', '^(.*?)\\|.*$', '\\1') | map('basename') | list }}"
-              when: failed_files is defined
 
             - name: Check if redownload screen session already exists
               shell: screen -ls | grep aria2c_redownload || true
@@ -430,15 +449,6 @@
               when: failed_files is defined and failed_files | length > 0
               become: false
 
-            - name: Show instructions for viewing redownload progress
-              debug:
-                msg:
-                  - "aria2c is redownloading failed files in a screen session. To view the progress:"
-                  - "1. SSH to the server: ssh {{ ansible_user }}@{{ ansible_host }}"
-                  - "2. Attach to the screen session: screen -r aria2c_redownload"
-                  - "3. To detach without killing the process: Ctrl+A followed by d"
-                  - "4. Alternatively, view the log file: tail -f {{ arbitrum_path }}/aria2c_redownload.log"
-
             - name: Wait for aria2c redownload to complete
               shell: >
                 while screen -list | grep -q "aria2c_redownload"; do
@@ -468,27 +478,6 @@
               delay: 5
               until: retry_result.rc == 0
               failed_when: false
-
-            - name: Debug - Show checksum verification output
-              debug:
-                msg:
-                  - "Return code: {{ retry_result.rc }}"
-                  - "Stdout:"
-                  - "{{ retry_result.stdout_lines | default([]) }}"
-                  - "Stderr:"
-                  - "{{ retry_result.stderr_lines | default([]) }}"
-              when: retry_result is defined
-
-            - name: Show failed checksums file content if it exists
-              shell: "cat {{ arbitrum_path }}/.checksum_failures.txt"
-              register: failures_content
-              when: retry_result.rc != 0
-              failed_when: false
-
-            - name: Debug - Show failed checksums
-              debug:
-                msg: "Failed checksums:\n{{ (failures_content.content | b64decode).split('\n') }}"
-              when: failures_content is defined and failures_content.content | default('') != ''
 
             - name: Check if validation succeeded after retries
               stat:
@@ -595,7 +584,3 @@
         fail_msg: "RPC response is invalid"
         success_msg: "RPC response is valid"
       register: rpc_response_valid
-
-    - name: Debug - Show RPC response
-      debug:
-        var: rpc_response.json
