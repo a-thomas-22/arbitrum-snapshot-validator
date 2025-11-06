@@ -10,6 +10,6 @@ chain_id_map:
   sepolia-rollup: 421614
   nova: 42170
 
-docker_image: "offchainlabs/nitro-node:v3.5.2-33d30c0"
+docker_image: "offchainlabs/nitro-node:v3.7.6-c0fe95e"
 parent_chain_url: "{{ lookup('env', 'PARENT_CHAIN_URL') }}"
 parent_chain_beacon_url: "{{ lookup('env', 'PARENT_CHAIN_BEACON_URL') }}"
