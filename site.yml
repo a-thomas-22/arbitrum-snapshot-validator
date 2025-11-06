@@ -211,6 +211,13 @@
         path: "{{ arbitrum_path }}/current.manifest"
       register: local_manifest
 
+    - name: Read existing manifest content
+      slurp:
+        src: "{{ arbitrum_path }}/current.manifest"
+      register: existing_manifest
+      when: local_manifest.stat.exists
+      ignore_errors: true
+
     - name: Get the latest snapshot directory
       uri:
         url: "https://snapshot.arbitrum.foundation/{{ chain_name }}/latest-{{ snapshot_type }}.txt"
@@ -231,7 +238,7 @@
       set_fact:
         manifest_changed: "{{ not local_manifest.stat.exists or
           (local_manifest.stat.exists and
-          manifest_file.content != lookup('file', arbitrum_path + '/current.manifest', errors='ignore') | default('')) }}"
+          manifest_file.content != (existing_manifest.content | b64decode)) }}"
 
     - name: Save current manifest
       copy:
